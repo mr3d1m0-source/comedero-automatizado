@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Dashboard Comedero - Horarios & Monitoreo</title>
+
+  <style>
+    :root{
+      --bg:#0b0f14;
+      --card:#111827;
+      --text:#e5e7eb;
+      --muted:#9ca3af;
+      --line:#1f2937;
+      --accent:#22c55e;
+      --danger:#ef4444;
+    }
+    *{box-sizing:border-box;font-family:system-ui}
+    body{margin:0;background:var(--bg);color:var(--text)}
+    .wrap{max-width:1100px;margin:auto;padding:24px}
+    h2{margin:18px 0 10px}
+    .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    .kpis{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+    .kpi{border:1px solid var(--line);border-radius:12px;padding:12px}
+    .kpi .label{color:var(--muted);font-size:13px;margin-bottom:6px}
+    button,input{background:#0f172a;border:1px solid var(--line);color:white;padding:10px;border-radius:10px}
+    input{min-width:160px}
+    .primary{border-color:var(--accent)}
+    .danger{border-color:var(--danger)}
+    table{width:100%;border-collapse:collapse}
+    th,td{border-bottom:1px solid var(--line);padding:10px;text-align:left}
+    th{color:var(--muted);font-weight:600;font-size:13px}
+    .small{font-size:12px;color:var(--muted)}
+    canvas{max-width:100%}
+    .spacer{height:10px}
+  </style>
+</head>
+
+<body>
+  <div class="wrap">
+    <h2>Estado en tiempo real</h2>
+    <div class="card kpis">
+      <div class="kpi">
+        <div class="label">Peso (celda de carga)</div>
+        <div><b><span id="peso">--</span> g</b></div>
+        <div class="small">Actualización: <span id="lastUpdate">--</span></div>
+      </div>
+
+      <div class="kpi">
+        <div class="label">Temperatura ambiente</div>
+        <div><b><span id="temp">--</span> °C</b></div>
+        <div class="small">Sensor: DHT22 (recomendado)</div>
+      </div>
+
+      <div class="kpi">
+        <div class="label">Humedad (opcional)</div>
+        <div><b><span id="hum">--</span> %</b></div>
+        <div class="small">Si no envías humedad, quedará “--”</div>
+      </div>
+    </div>
+
+    <h2>Registrar programación</h2>
+    <div class="card row">
+      <input type="number" id="pollos" min="1" placeholder="Cantidad de pollos">
+      <input type="time" id="hora">
+      <button class="primary" id="btnGuardar">Guardar</button>
+      <span class="small">Se guarda en Firebase y aparece abajo en la tabla.</span>
+    </div>
+
+    <div class="spacer"></div>
+
+    <h2>Programaciones guardadas</h2>
+    <div class="card">
+      <div class="small">Puedes eliminar una fila si ya no la quieres.</div>
+      <div class="spacer"></div>
+      <table>
+        <thead>
+          <tr>
+            <th>Horario</th>
+            <th>Pollos</th>
+            <th>Creado</th>
+            <th>Acciones</th>
+          </tr>
+        </thead>
+        <tbody id="tablaBody">
+          <tr><td colspan="4" class="small">Cargando...</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>Consumo (por bajada de peso) - últimos 7 días</h2>
+    <div class="card">
+      <canvas id="pie"></canvas>
+      <div class="spacer"></div>
+      <button class="primary" id="btnInforme">Descargar informe (CSV)</button>
+      <div class="small">
+        El consumo se acumula cuando el peso baja. Si el peso sube (recarga), no se cuenta como consumo.
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.4/firebase-app.js";
+    import {
+      getDatabase, ref, onValue, set, push, remove, update,
+      serverTimestamp, query, orderByKey, limitToLast, increment
+    } from "https://www.gstatic.com/firebasejs/10.12.4/firebase-database.js";
+
+    // ------------------ Firebase ------------------
+    const app = initializeApp({
+      apiKey: "AIzaSyB3EabnsNBXB3SCt7LQWuneMhO8L2wy-7M",
+      databaseURL: "https://eerm-cd74f-default-rtdb.firebaseio.com",
+    });
+    const db = getDatabase(app);
+
+    const $ = (id) => document.getElementById(id);
+
+    // ------------------ Refs (rutas sugeridas) ------------------
+    const telemetryRef = ref(db, "telemetry");
+    const schedulesRef = ref(db, "app/schedules");              // aquí guardamos (pollos, hora)
+    const dailyRefBase = ref(db, "logs/consumptionDaily");      // aquí guardamos consumo por día (YYYY-MM-DD)
+    const eventsRef = ref(db, "logs/consumptionEvents");        // opcional: eventos de bajada (para informe detallado)
+
+    // ------------------ UI: Tabla de programaciones ------------------
+    function renderTabla(dataObj){
+      const tbody = $("tablaBody");
+      tbody.innerHTML = "";
+
+      const entries = dataObj ? Object.entries(dataObj) : [];
+      if (entries.length === 0){
+        tbody.innerHTML = `<tr><td colspan="4" class="small">No hay programaciones guardadas.</td></tr>`;
+        return;
+      }
+
+      // ordena por hora (si existe)
+      entries.sort((a,b) => (a[1].hora || "").localeCompare(b[1].hora || ""));
+
+      for (const [id, v] of entries){
+        const tr = document.createElement("tr");
+
+        const created = (typeof v.createdAt === "number")
+          ? new Date(v.createdAt).toLocaleString()
+          : (v.createdAt && typeof v.createdAt === "object") ? "—" : "—";
+
+        tr.innerHTML = `
+          <td>${v.hora ?? "—"}</td>
+          <td>${v.pollos ?? "—"}</td>
+          <td>${created}</td>
+          <td>
+            <button class="danger" data-id="${id}">Eliminar</button>
+          </td>
+        `;
+        tbody.appendChild(tr);
+      }
+
+      tbody.querySelectorAll("button.danger").forEach(btn => {
+        btn.onclick = async () => {
+          const id = btn.getAttribute("data-id");
+          await remove(ref(db, `app/schedules/${id}`));
+        };
+      });
+    }
+
+    onValue(schedulesRef, (snap) => {
+      renderTabla(snap.val());
+    });
+
+    $("btnGuardar").onclick = async () => {
+      const pollos = +$("pollos").value;
+      const hora = $("hora").value;
+
+      if (!pollos || pollos <= 0 || !hora){
+        alert("Ingresa una cantidad válida de pollos y un horario.");
+        return;
+      }
+
+      const newRef = push(schedulesRef);
+      // Realtime DB: serverTimestamp() funciona (se verá como número al leerse después de sincronizar)
+      await set(newRef, {
+        pollos,
+        hora,
+        createdAt: serverTimestamp(),
+      });
+
+      $("pollos").value = "";
+      // $("hora").value = ""; // si quieres que se limpie
+    };
+
+    // ------------------ UI: Telemetría (peso + DHT22) ------------------
+    function fmt(n, dec=1){
+      return (typeof n === "number" && !Number.isNaN(n)) ? n.toFixed(dec) : "--";
+    }
+
+    // ------------------ Consumo por bajada de peso ------------------
+    // Ajusta este umbral para filtrar ruido de la celda de carga:
+    const MIN_DELTA_G = 2.0;     // no contar bajadas < 2g (ruido)
+    const MAX_DELTA_G = 5000.0;  // no contar bajadas absurdas (protección)
+    const STORAGE_LAST_W = "lastWeight_g";
+    const STORAGE_LAST_TS = "lastTelemetry_ts";
+
+    function localDateKey(d){
+      // YYYY-MM-DD en hora local
+      const y = d.getFullYear();
+      const m = String(d.getMonth()+1).padStart(2,"0");
+      const day = String(d.getDate()).padStart(2,"0");
+      return `${y}-${m}-${day}`;
+    }
+
+    async function logConsumptionDelta(deltaG, telemetryTsSec){
+      const now = new Date();
+      const dayKey = localDateKey(now);
+
+      // 1) acumular total del día
+      await update(ref(db, `logs/consumptionDaily/${dayKey}`), {
+        grams: increment(deltaG),
+        updatedAt: serverTimestamp(),
+      });
+
+      // 2) (opcional) guardar evento para informe detallado
+      const ev = push(eventsRef);
+      await set(ev, {
+        ts: telemetryTsSec || Math.floor(Date.now()/1000),
+        grams: deltaG,
+        day: dayKey,
+      });
+    }
+
+    function maybeTrackConsumptionFromTelemetry(t){
+      // Se recomienda que el ESP32 mande un timestamp (segundos) en telemetry.ts
+      const w = (typeof t.peso_g === "number") ? t.peso_g : null;
+      const ts = (typeof t.ts === "number") ? t.ts : null;
+
+      if (w === null) return;
+
+      // Evitar procesar la misma muestra 2 veces (si hay reconexión)
+      if (ts !== null){
+        const lastTs = +localStorage.getItem(STORAGE_LAST_TS) || 0;
+        if (ts <= lastTs) {
+          // actualizar lastWeight igualmente, por si acaso
+          localStorage.setItem(STORAGE_LAST_W, String(w));
+          return;
+        }
+        localStorage.setItem(STORAGE_LAST_TS, String(ts));
+      }
+
+      const lastW = +localStorage.getItem(STORAGE_LAST_W);
+      if (Number.isFinite(lastW)){
+        const delta = lastW - w; // consumo si baja
+        if (delta >= MIN_DELTA_G && delta <= MAX_DELTA_G){
+          // OJO: si hay 2 dashboards abiertos, contaría doble.
+          logConsumptionDelta(Number(delta.toFixed(2)), ts);
+        }
+      }
+      localStorage.setItem(STORAGE_LAST_W, String(w));
+    }
+
+    onValue(telemetryRef, (snap) => {
+      const t = snap.val();
+      if (!t) return;
+
+      $("peso").textContent = fmt(t.peso_g, 1);
+      $("temp").textContent = fmt(t.temp_c, 1);
+      $("hum").textContent  = fmt(t.hum_pct, 0);
+
+      const stamp = (typeof t.ts === "number") ? new Date(t.ts*1000) : new Date();
+      $("lastUpdate").textContent = stamp.toLocaleTimeString();
+
+      // Consumir por bajada de peso
+      maybeTrackConsumptionFromTelemetry(t);
+    });
+
+    // ------------------ Gráfico (Pie) últimos 7 días ------------------
+    const pie = new Chart(document.getElementById("pie"), {
+      type: "pie",
+      data: {
+        labels: ["L", "M", "X", "J", "V", "S", "D"],
+        datasets: [{ data: [0,0,0,0,0,0,0] }],
+      },
+    });
+
+    // Lee últimos 7 días por clave YYYY-MM-DD
+    const dailyQuery = query(dailyRefBase, orderByKey(), limitToLast(7));
+
+    let dailyCache = {};
+    onValue(dailyQuery, (snap) => {
+      dailyCache = snap.val() || {};
+
+      const sum = [0,0,0,0,0,0,0]; // L..D
+      for (const [dayKey, v] of Object.entries(dailyCache)){
+        const grams = (v && typeof v.grams === "number") ? v.grams : 0;
+        const d = new Date(dayKey + "T00:00:00");
+        let i = d.getDay();          // 0 domingo ... 6 sábado
+        i = (i === 0) ? 6 : (i - 1); // lunes=0 ... domingo=6
+        sum[i] += grams;
+      }
+
+      pie.data.datasets[0].data = sum.map(x => Math.round(x));
+      pie.update();
+    });
+
+    // ------------------ Informe CSV ------------------
+    $("btnInforme").onclick = async () => {
+      // Informe basado en eventos (más detallado).
+      // Si prefieres por día, dímelo y lo saco desde consumptionDaily.
+      let csv = "fecha,hora,gramos\n";
+
+      // Descargar lo que ya está en cache (últimos 7 días por día)
+      // + además intentamos leer eventos completos (si existen)
+      // Para simplificar, exporto por día (fácil y útil):
+      const entries = Object.entries(dailyCache).sort((a,b)=>a[0].localeCompare(b[0]));
+      for (const [dayKey, v] of entries){
+        const grams = (v && typeof v.grams === "number") ? v.grams : 0;
+        csv += `${dayKey},00:00,${grams}\n`;
+      }
+
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+      a.download = "informe_consumo_ultimos_7_dias.csv";
+      a.click();
+    };
+  </script>
+</body>
+</html>
